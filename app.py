@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import math
 import os
+import json
 import re
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from urllib.parse import quote as urlquote
 from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import requests
 from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
@@ -272,7 +276,7 @@ function cssVar(name){return getComputedStyle(document.documentElement).getPrope
 
 function chartOptions(){
   return{
-    layout:{background:{type:"solid",color:cssVar("--panel")},textColor:cssVar("--muted"),fontFamily:"Inter, Noto Sans Thai, sans-serif",fontSize:10},
+    layout:{background:{type:"solid",color:cssVar("--panel")},textColor:cssVar("--muted"),fontFamily:"Inter, Noto Sans Thai, sans-serif",fontSize:10,attributionLogo:false},
     grid:{vertLines:{color:cssVar("--line-soft")},horzLines:{color:cssVar("--line-soft")}},
     crosshair:{
       vertLine:{color:"#65748a",width:1,style:2,labelBackgroundColor:"#263344"},
@@ -454,8 +458,8 @@ async function loadInstrument(symbol,name){
     updateCharts();
     renderOrderTicket();
     $("lastUpdated").textContent="Last update: "+new Date().toLocaleTimeString("th-TH");
-    loadNews(cleaned);
-    loadWatchlistQuotes();
+    setTimeout(()=>loadNews(cleaned),700);
+    setTimeout(loadWatchlistQuotes,1400);
   }catch(error){
     toast("โหลดสินทรัพย์ไม่สำเร็จ",error.message);
   }finally{
@@ -787,8 +791,8 @@ async function boot(){
   renderWatchlist();
   renderPositions();
   await healthCheck();
-  loadMarketOverview();
   await loadInstrument(state.symbol,state.name);
+  setTimeout(loadMarketOverview,1200);
   setInterval(()=>{
     if(document.visibilityState==="visible"){
       loadInstrument(state.symbol,state.name);
@@ -1089,20 +1093,146 @@ def time_value(index_value: Any) -> int:
     return int(stamp.timestamp())
 
 
-def history_payload(symbol: str, period: str, interval: str, prepost: bool) -> dict[str, Any]:
-    ticker = yf.Ticker(symbol)
-    df = ticker.history(
-        period=period,
-        interval=interval,
-        auto_adjust=False,
-        actions=False,
-        prepost=prepost,
-        repair=True,
-        timeout=15,
-        raise_errors=False,
+YAHOO_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/149.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+}
+
+def yahoo_json(url: str, params: dict[str, Any]) -> dict[str, Any]:
+    response = requests.get(
+        url,
+        params=params,
+        headers=YAHOO_HEADERS,
+        timeout=18,
     )
-    if df is None or df.empty:
+    if response.status_code == 429:
+        raise RuntimeError("Yahoo Finance จำกัดจำนวนคำขอชั่วคราว (HTTP 429)")
+    response.raise_for_status()
+    try:
+        return response.json()
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Yahoo Finance ส่งข้อมูลที่อ่านไม่ได้") from exc
+
+
+def yahoo_chart_frame(
+    symbol: str,
+    period: str,
+    interval: str,
+    prepost: bool = False,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    url = (
+        "https://query1.finance.yahoo.com/v8/finance/chart/"
+        + urlquote(symbol, safe="")
+    )
+    payload = yahoo_json(
+        url,
+        {
+            "range": period,
+            "interval": interval,
+            "includePrePost": str(prepost).lower(),
+            "events": "div,splits",
+            "includeAdjustedClose": "true",
+        },
+    )
+
+    chart = payload.get("chart") or {}
+    if chart.get("error"):
+        description = chart["error"].get("description") or "Yahoo Finance error"
+        raise LookupError(description)
+
+    results = chart.get("result") or []
+    if not results:
         raise LookupError(f"ไม่พบข้อมูลราคา {symbol}")
+
+    result = results[0]
+    timestamps = result.get("timestamp") or []
+    indicators = result.get("indicators") or {}
+    quotes = indicators.get("quote") or []
+
+    if not timestamps or not quotes:
+        raise LookupError(f"ไม่พบข้อมูลแท่งราคา {symbol}")
+
+    quote_data = quotes[0]
+    length = len(timestamps)
+
+    def values(name: str) -> list[Any]:
+        raw = quote_data.get(name) or []
+        return list(raw[:length]) + [None] * max(0, length - len(raw))
+
+    df = pd.DataFrame(
+        {
+            "Open": values("open"),
+            "High": values("high"),
+            "Low": values("low"),
+            "Close": values("close"),
+            "Volume": values("volume"),
+        },
+        index=pd.to_datetime(timestamps, unit="s", utc=True),
+    )
+
+    adjclose_sets = indicators.get("adjclose") or []
+    if adjclose_sets:
+        raw_adj = adjclose_sets[0].get("adjclose") or []
+        df["Adj Close"] = list(raw_adj[:length]) + [None] * max(0, length - len(raw_adj))
+
+    for column in ("Open", "High", "Low", "Close", "Volume"):
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    if df.empty:
+        raise LookupError(f"ไม่พบข้อมูลราคาที่ใช้ได้ของ {symbol}")
+
+    return df, (result.get("meta") or {})
+
+
+def market_frame(
+    symbol: str,
+    period: str,
+    interval: str,
+    prepost: bool = False,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """
+    ใช้ Yahoo chart endpoint โดยตรงก่อน เพื่อเลี่ยงขั้นตอน consent/cookie
+    ที่ yfinance บางรุ่นเรียกผ่าน guce.yahoo.com บน Cloud Hosting
+    แล้วค่อย fallback ไป yfinance หาก endpoint แรกใช้งานไม่ได้
+    """
+    direct_error: Exception | None = None
+
+    try:
+        return yahoo_chart_frame(symbol, period, interval, prepost)
+    except Exception as exc:
+        direct_error = exc
+        app.logger.warning("Yahoo direct endpoint failed for %s: %s", symbol, exc)
+
+    try:
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            actions=False,
+            prepost=prepost,
+            repair=False,
+            timeout=15,
+            raise_errors=True,
+        )
+        if df is None or df.empty:
+            raise LookupError(f"ไม่พบข้อมูลราคา {symbol}")
+        return df, {}
+    except Exception as yf_error:
+        raise RuntimeError(
+            f"โหลดข้อมูลตลาดไม่สำเร็จ: direct={direct_error}; yfinance={yf_error}"
+        ) from yf_error
+
+
+def history_payload(symbol: str, period: str, interval: str, prepost: bool) -> dict[str, Any]:
+    df, _meta = market_frame(symbol, period, interval, prepost)
 
     required = {"Open", "High", "Low", "Close", "Volume"}
     if not required.issubset(set(df.columns)):
@@ -1210,10 +1340,7 @@ def history_payload(symbol: str, period: str, interval: str, prepost: bool) -> d
 
 
 def quote_payload(symbol: str) -> dict[str, Any]:
-    ticker = yf.Ticker(symbol)
-    df = ticker.history(period="5d", interval="1d", auto_adjust=False, actions=False, repair=True)
-    if df is None or df.empty:
-        raise LookupError(f"ไม่พบข้อมูล {symbol}")
+    df, meta = market_frame(symbol, "5d", "1d", False)
 
     df = df.dropna(subset=["Close"])
     if df.empty:
@@ -1221,67 +1348,74 @@ def quote_payload(symbol: str) -> dict[str, Any]:
 
     last = df.iloc[-1]
     previous = df.iloc[-2] if len(df) > 1 else last
-    price = scalar(last, "Close") or 0
-    previous_close = scalar(previous, "Close") or price
+
+    price = finite_or_none(meta.get("regularMarketPrice")) or scalar(last, "Close") or 0
+    previous_close = (
+        finite_or_none(meta.get("chartPreviousClose"))
+        or finite_or_none(meta.get("previousClose"))
+        or scalar(previous, "Close")
+        or price
+    )
+
     change = price - previous_close
     change_percent = (change / previous_close * 100) if previous_close else 0
-
-    currency = ""
-    exchange = ""
-    quote_type = ""
-    name = symbol
-    market_cap = None
-    day_high = scalar(last, "High")
-    day_low = scalar(last, "Low")
-    day_open = scalar(last, "Open")
-    volume = scalar(last, "Volume")
-
-    try:
-        fast = ticker.fast_info
-        currency = getattr(fast, "currency", "") or ""
-        exchange = getattr(fast, "exchange", "") or ""
-        market_cap = finite_or_none(getattr(fast, "market_cap", None))
-        day_high = finite_or_none(getattr(fast, "day_high", None)) or day_high
-        day_low = finite_or_none(getattr(fast, "day_low", None)) or day_low
-        day_open = finite_or_none(getattr(fast, "open", None)) or day_open
-        volume = finite_or_none(getattr(fast, "last_volume", None)) or volume
-    except Exception:
-        pass
-
-    try:
-        info = ticker.get_info()
-        name = info.get("shortName") or info.get("longName") or symbol
-        quote_type = info.get("quoteType") or ""
-        exchange = exchange or info.get("exchange") or info.get("fullExchangeName") or ""
-        currency = currency or info.get("currency") or ""
-        market_cap = market_cap or finite_or_none(info.get("marketCap"))
-    except Exception:
-        pass
 
     return {
         "ok": True,
         "symbol": symbol,
-        "name": name,
+        "name": (
+            meta.get("longName")
+            or meta.get("shortName")
+            or meta.get("symbol")
+            or symbol
+        ),
         "price": price,
         "previousClose": previous_close,
         "change": change,
         "changePercent": change_percent,
-        "open": day_open,
-        "high": day_high,
-        "low": day_low,
-        "volume": volume,
-        "currency": currency,
-        "exchange": exchange,
-        "quoteType": quote_type,
-        "marketCap": market_cap,
+        "open": finite_or_none(meta.get("regularMarketOpen")) or scalar(last, "Open"),
+        "high": finite_or_none(meta.get("regularMarketDayHigh")) or scalar(last, "High"),
+        "low": finite_or_none(meta.get("regularMarketDayLow")) or scalar(last, "Low"),
+        "volume": finite_or_none(meta.get("regularMarketVolume")) or scalar(last, "Volume"),
+        "currency": meta.get("currency") or "",
+        "exchange": meta.get("fullExchangeName") or meta.get("exchangeName") or "",
+        "quoteType": meta.get("instrumentType") or "",
+        "marketCap": finite_or_none(meta.get("marketCap")),
         "timestamp": int(time.time()),
     }
 
 
 def search_payload(query: str) -> dict[str, Any]:
-    search = yf.Search(query, max_results=12, news_count=0, enable_fuzzy_query=True)
-    raw_quotes = getattr(search, "quotes", []) or []
-    results = []
+    normalized = query.strip().upper()
+    results: list[dict[str, Any]] = []
+
+    gold_queries = {
+        "XAU/USD", "XAUUSD", "XAUUSD=X", "XAU", "GOLD",
+        "GOLD SPOT", "SPOT GOLD", "ทอง", "ทองคำ"
+    }
+    if normalized in gold_queries or "XAU" in normalized:
+        results.append({
+            "symbol": "GC=F",
+            "name": "Gold Futures — Yahoo proxy for XAU/USD",
+            "exchange": "COMEX",
+            "type": "FUTURE",
+        })
+
+    try:
+        payload = yahoo_json(
+            "https://query1.finance.yahoo.com/v1/finance/search",
+            {
+                "q": query,
+                "quotesCount": 12,
+                "newsCount": 0,
+                "enableFuzzyQuery": "true",
+            },
+        )
+        raw_quotes = payload.get("quotes") or []
+    except Exception as direct_error:
+        app.logger.warning("Yahoo direct search failed: %s", direct_error)
+        search = yf.Search(query, max_results=12, news_count=0, enable_fuzzy_query=True)
+        raw_quotes = getattr(search, "quotes", []) or []
 
     for item in raw_quotes:
         quote_type = (item.get("quoteType") or item.get("typeDisp") or "").upper()
@@ -1292,7 +1426,14 @@ def search_payload(query: str) -> dict[str, Any]:
             continue
         results.append({
             "symbol": symbol,
-            "name": item.get("shortname") or item.get("longname") or item.get("name") or symbol,
+            "name": (
+                item.get("shortname")
+                or item.get("longname")
+                or item.get("shortName")
+                or item.get("longName")
+                or item.get("name")
+                or symbol
+            ),
             "exchange": item.get("exchDisp") or item.get("exchange") or "",
             "type": quote_type or "MARKET",
         })
@@ -1301,24 +1442,68 @@ def search_payload(query: str) -> dict[str, Any]:
 
 
 def news_payload(symbol: str) -> dict[str, Any]:
-    ticker = yf.Ticker(symbol)
-    raw_news = ticker.get_news(count=8, tab="news") or []
-    results = []
+    try:
+        payload = yahoo_json(
+            "https://query1.finance.yahoo.com/v1/finance/search",
+            {
+                "q": symbol,
+                "quotesCount": 0,
+                "newsCount": 8,
+                "enableFuzzyQuery": "true",
+            },
+        )
+        raw_news = payload.get("news") or []
+    except Exception as direct_error:
+        app.logger.warning("Yahoo direct news failed: %s", direct_error)
+        ticker = yf.Ticker(symbol)
+        raw_news = ticker.get_news(count=8, tab="news") or []
+
+    results: list[dict[str, Any]] = []
 
     for entry in raw_news:
-        content = entry.get("content") if isinstance(entry, dict) else None
-        item = content if isinstance(content, dict) else entry
-        if not isinstance(item, dict):
+        if not isinstance(entry, dict):
             continue
+
+        content = entry.get("content")
+        item = content if isinstance(content, dict) else entry
 
         provider = item.get("provider") or {}
         click_url = item.get("clickThroughUrl") or item.get("canonicalUrl") or {}
+        thumbnail = item.get("thumbnail") or {}
+        resolutions = thumbnail.get("resolutions") if isinstance(thumbnail, dict) else []
+
+        url = (
+            item.get("link")
+            or (click_url.get("url") if isinstance(click_url, dict) else "")
+            or ""
+        )
+
+        published = item.get("pubDate") or item.get("displayTime") or ""
+        unix_time = item.get("providerPublishTime")
+        if unix_time and not published:
+            try:
+                published = datetime.fromtimestamp(
+                    int(unix_time), tz=timezone.utc
+                ).isoformat()
+            except Exception:
+                published = ""
+
+        publisher = (
+            item.get("publisher")
+            or (provider.get("displayName") if isinstance(provider, dict) else "")
+            or ""
+        )
 
         results.append({
             "title": item.get("title") or "Market news",
-            "publisher": provider.get("displayName") if isinstance(provider, dict) else "",
-            "url": click_url.get("url") if isinstance(click_url, dict) else "",
-            "published": item.get("pubDate") or item.get("displayTime") or "",
+            "publisher": publisher,
+            "url": url,
+            "published": published,
+            "thumbnail": (
+                resolutions[0].get("url")
+                if resolutions and isinstance(resolutions[0], dict)
+                else ""
+            ),
         })
 
     return {"ok": True, "symbol": symbol, "results": results[:6]}
@@ -1332,6 +1517,26 @@ def index():
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True, "service": "Leng Market Terminal", "time": int(time.time())})
+
+
+@app.get("/api/diagnostic")
+def diagnostic():
+    try:
+        df, meta = market_frame("AAPL", "5d", "1d", False)
+        return jsonify({
+            "ok": True,
+            "message": "Market data connection works",
+            "rows": len(df),
+            "source": "Yahoo chart endpoint / yfinance fallback",
+            "currency": meta.get("currency", ""),
+        })
+    except Exception as exc:
+        app.logger.exception("Market diagnostic failed")
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+            "yfinanceVersion": getattr(yf, "__version__", "unknown"),
+        }), 502
 
 
 @app.get("/api/search")
